@@ -175,6 +175,7 @@ struct FavoriteStopProvider: AppIntentTimelineProvider {
                 )
             }
 
+            // Sort by earliest departure
             matchingTrips = filtered.sorted { $0.departureTime < $1.departureTime }
 
         } catch {
@@ -196,10 +197,17 @@ struct FavoriteStopProvider: AppIntentTimelineProvider {
 
         for minuteOffset in 0..<maxMinutes {
             let entryDate = now.addingTimeInterval(Double(minuteOffset * 60))
+            
+            // Filter out any trips that have departed before this entry’s time
+            let upcomingTripsForThisEntry = matchingTrips.filter { trip in
+                let depTimeDate = Date(timeIntervalSince1970: TimeInterval(trip.departureTime))
+                return depTimeDate >= entryDate
+            }
+
             let entry = FavoriteStopEntry(
                 date: entryDate,
                 stopID: chosenStop,
-                upcomingTrips: matchingTrips,
+                upcomingTrips: upcomingTripsForThisEntry,
                 direction: selectedDirection,
                 lastFetchTime: fetchTime
             )
@@ -371,14 +379,14 @@ struct FavoriteStopWidgetEntryView: View {
     // Converts departureTime -> “minutes from currentTime”
     private func minutesUntilDeparture(_ departureUnix: Int, from currentTime: Date) -> Int {
         let departureDate = Date(timeIntervalSince1970: TimeInterval(departureUnix))
-        let diff          = departureDate.timeIntervalSince(currentTime)
+        let diff = departureDate.timeIntervalSince(currentTime)
         return max(0, Int(diff / 60))
     }
 
     // Helper to format a Unix timestamp into local time
     private func formattedTime(_ seconds: Int) -> String {
         guard seconds > 0 else { return "--" }
-        let date      = Date(timeIntervalSince1970: TimeInterval(seconds))
+        let date = Date(timeIntervalSince1970: TimeInterval(seconds))
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
