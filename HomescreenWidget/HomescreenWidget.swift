@@ -9,6 +9,11 @@ import SwiftUI
 import WidgetKit
 import AppIntents
 
+// Make sure this import or module reference matches how your project is set up.
+// If "GtfsModels.swift" is in the same module, you might only need "import Foundation."
+// But if it's a separate target or Swift package, adjust accordingly.
+import Foundation
+
 // MARK: - 1) An AppEnum for directions (Inbound, Outbound, All)
 enum GOTransitDirection: String, AppEnum {
     case inbound  = "Inbound"
@@ -82,6 +87,8 @@ struct FavoriteStopProvider: AppIntentTimelineProvider {
         )
     }
 
+    // MARK: - Minute-by-minute timeline approach
+    // We only fetch once, then create multiple entries (one per minute).
     func timeline(for configuration: SelectStopIntent, in context: Context) async -> Timeline<FavoriteStopEntry> {
         let chosenStop = configuration.stopID
         let selectedDirection = configuration.direction
@@ -97,16 +104,23 @@ struct FavoriteStopProvider: AppIntentTimelineProvider {
             return Timeline(entries: [fallback], policy: .after(Date().addingTimeInterval(3600)))
         }
 
+        // We'll store the final list of matching trips here
+        let matching: [WidgetTripData]
+
         do {
-            // 2) Fetch data
+            // 2) Fetch data once
             let (data, _) = try await URLSession.shared.data(from: url)
 
-            // 3) Decode the feed (Your GtfsRealtimeFeed & TripUpdate models are assumed to exist)
+            // 3) Decode the feed (GtfsRealtimeFeed is defined in GtfsModels.swift)
             let feed = try JSONDecoder().decode(GtfsRealtimeFeed.self, from: data)
 
-            // 4) Convert to your custom [TripUpdate]
+            // 4) Convert to [TripUpdate] (the domain model at bottom of GtfsModels)
             let allTrips: [TripUpdate] = feed.entity.compactMap { entity in
-                guard let tu = entity.tripUpdate else { return nil }
+                guard let tu = entity.tripUpdate else {
+                    return nil
+                }
+
+                // Build our domain TripUpdate struct
                 return TripUpdate(
                     id: entity.id,
                     tripId: tu.trip?.tripId ?? "Unknown",
@@ -122,7 +136,7 @@ struct FavoriteStopProvider: AppIntentTimelineProvider {
             }
 
             // 5) Filter for trips that include `chosenStop`
-            let matching: [WidgetTripData] = allTrips.compactMap { trip in
+            let filtered = allTrips.compactMap { trip -> WidgetTripData? in
                 guard let stopTime = trip.stopTimeUpdates.first(where: { $0.stopId == chosenStop }) else {
                     return nil
                 }
@@ -159,21 +173,12 @@ struct FavoriteStopProvider: AppIntentTimelineProvider {
                     delay: trip.delay ?? 0
                 )
             }
-            .sorted { $0.departureTime < $1.departureTime }
 
-            // 6) Build the timeline entry
-            let entry = FavoriteStopEntry(
-                date: Date(),
-                stopID: chosenStop,
-                upcomingTrips: matching,
-                direction: selectedDirection
-            )
-
-            // 7) Decide when the widget should refresh next
-            let refreshDate = Date().addingTimeInterval(15 * 60)
-            return Timeline(entries: [entry], policy: .after(refreshDate))
+            // Sort by earliest departure time
+            matching = filtered.sorted { $0.departureTime < $1.departureTime }
 
         } catch {
+            // If fetching or decoding fails, return a fallback entry
             let fallback = FavoriteStopEntry(
                 date: Date(),
                 stopID: chosenStop,
@@ -182,6 +187,29 @@ struct FavoriteStopProvider: AppIntentTimelineProvider {
             )
             return Timeline(entries: [fallback], policy: .after(Date().addingTimeInterval(3600)))
         }
+
+        // 6) Build multiple timeline entries (one for each minute, for up to N minutes)
+        let now = Date()
+        // For example, show minute-by-minute countdown for the next 30 minutes:
+        let maxMinutes = 30
+
+        var entries: [FavoriteStopEntry] = []
+
+        for minuteOffset in 0..<maxMinutes {
+            let entryDate = now.addingTimeInterval(Double(minuteOffset * 60))
+
+            let entry = FavoriteStopEntry(
+                date: entryDate,
+                stopID: chosenStop,
+                upcomingTrips: matching,
+                direction: selectedDirection
+            )
+            entries.append(entry)
+        }
+
+        // 7) Return all entries. The system will display them at the correct time.
+        //    You can choose .never if you want no auto-refresh, or .after(...) for a fallback refresh.
+        return Timeline(entries: entries, policy: .never)
     }
 }
 
@@ -216,7 +244,7 @@ struct FavoriteStopWidget: Widget {
     }
 }
 
-// MARK: - 8) The Widget UI, now with a "Refresh" Button
+// MARK: - 8) The Widget UI, now with a "Refresh" Button + countdown
 struct FavoriteStopWidgetEntryView: View {
     let entry: FavoriteStopEntry
 
@@ -245,8 +273,9 @@ struct FavoriteStopWidgetEntryView: View {
                     .foregroundColor(.secondary)
                     .font(.subheadline)
             } else {
+                // Show up to 3 upcoming trips
                 ForEach(entry.upcomingTrips.prefix(3), id: \.tripId) { item in
-                    tripRow(item)
+                    tripRow(item, currentTime: entry.date)
                 }
             }
         }
@@ -264,7 +293,7 @@ struct FavoriteStopWidgetEntryView: View {
 
     // Helper: row for each trip
     @ViewBuilder
-    private func tripRow(_ item: WidgetTripData) -> some View {
+    private func tripRow(_ item: WidgetTripData, currentTime: Date) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             // Vehicle label & direction
             HStack {
@@ -276,10 +305,14 @@ struct FavoriteStopWidgetEntryView: View {
                     .foregroundColor(.secondary)
             }
             
+            // "Departs in X min"
+            let minutesLeft = minutesUntilDeparture(item.departureTime, from: currentTime)
+
             HStack {
-                Text("Dep: \(formattedTime(item.departureTime))")
+                Text("Departure: \(formattedTime(item.departureTime))")
                 Spacer()
-                Text("Arr: \(formattedTime(item.arrivalTime))")
+                Text("\(minutesLeft) min left")
+                    .foregroundColor(.blue)
             }
             .font(.caption)
             
@@ -292,7 +325,14 @@ struct FavoriteStopWidgetEntryView: View {
         .padding(.vertical, 4)
     }
 
-    // Helper: format Unix timestamps to short times
+    // Converts departureTime to "minutes from currentTime"
+    private func minutesUntilDeparture(_ departureUnix: Int, from currentTime: Date) -> Int {
+        let departureDate = Date(timeIntervalSince1970: TimeInterval(departureUnix))
+        let diff = departureDate.timeIntervalSince(currentTime)
+        return max(0, Int(diff / 60))
+    }
+
+    // Formats a Unix timestamp into a short local time string
     private func formattedTime(_ seconds: Int) -> String {
         guard seconds > 0 else { return "--" }
         let date = Date(timeIntervalSince1970: TimeInterval(seconds))
